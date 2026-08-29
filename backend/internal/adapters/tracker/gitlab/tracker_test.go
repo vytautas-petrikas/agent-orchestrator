@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -72,6 +73,134 @@ func (f *fakeGL) calls() []recordedReq {
 	out := make([]recordedReq, len(f.requests))
 	copy(out, f.requests)
 	return out
+}
+
+// onGraphQL registers a handler for POST /api/v4/graphql. This is the
+// primary test seam for all GraphQL-based tracker operations.
+func (f *fakeGL) onGraphQL(h http.HandlerFunc) {
+	f.on(http.MethodPost, "/api/v4/graphql", h)
+}
+
+// gqlReq parses the recorded request body as a GraphQL request and returns
+// the variables map. Fails the test on parse error.
+func gqlReq(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var req struct {
+		Query     string         `json:"query"`
+		Variables map[string]any `json:"variables"`
+	}
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("parse graphql request: %v\nbody: %s", err, body)
+	}
+	return req.Variables
+}
+
+// writeJSON writes a JSON response and fails the test on error.
+func writeJSON(t *testing.T, w http.ResponseWriter, v any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		t.Fatalf("write json: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GraphQL response builders
+// ---------------------------------------------------------------------------
+
+// buildWorkItemNode constructs a map representing a single GraphQL work item
+// node with the given fields. Widgets are included for assignees and labels.
+func buildWorkItemNode(iid, title, description, state, webURL string, labels, assignees []string) map[string]any {
+	node := map[string]any{
+		"iid":         iid,
+		"title":       title,
+		"description": description,
+		"state":       state,
+		"webUrl":      webURL,
+	}
+	widgets := []any{}
+	if len(assignees) > 0 {
+		nodes := []any{}
+		for _, a := range assignees {
+			nodes = append(nodes, map[string]any{"username": a})
+		}
+		widgets = append(widgets, map[string]any{
+			"type":      "ASSIGNEES",
+			"assignees": map[string]any{"nodes": nodes},
+		})
+	}
+	if len(labels) > 0 {
+		nodes := []any{}
+		for _, l := range labels {
+			nodes = append(nodes, map[string]any{"title": l})
+		}
+		widgets = append(widgets, map[string]any{
+			"type":   "LABELS",
+			"labels": map[string]any{"nodes": nodes},
+		})
+	}
+	node["widgets"] = widgets
+	return node
+}
+
+// buildListResponse wraps work item nodes in a GraphQL list response with
+// pageInfo. hasNextPage/endCursor control pagination.
+func buildListResponse(nodes []any, hasNextPage bool, endCursor string) map[string]any {
+	return map[string]any{
+		"data": map[string]any{
+			"project": map[string]any{
+				"workItems": map[string]any{
+					"nodes":    nodes,
+					"pageInfo": map[string]any{"endCursor": endCursor, "hasNextPage": hasNextPage},
+				},
+			},
+		},
+	}
+}
+
+// buildGetResponse wraps a single work item in a GraphQL get response.
+func buildGetResponse(node map[string]any) map[string]any {
+	return map[string]any{
+		"data": map[string]any{
+			"project": map[string]any{
+				"workItem": node,
+			},
+		},
+	}
+}
+
+// buildNullProjectResponse returns a GraphQL response with data.project = null.
+func buildNullProjectResponse() map[string]any {
+	return map[string]any{
+		"data": map[string]any{
+			"project": nil,
+		},
+	}
+}
+
+// buildGraphQLErrorResponse returns a GraphQL response with an errors array.
+func buildGraphQLErrorResponse(code, message string) map[string]any {
+	return map[string]any{
+		"data": nil,
+		"errors": []any{
+			map[string]any{
+				"message":    message,
+				"extensions": map[string]any{"code": code},
+			},
+		},
+	}
+}
+
+// buildNullWorkItemResponse returns a GraphQL response where project exists but
+// workItem is null (e.g. iid not found within the project).
+func buildNullWorkItemResponse() map[string]any {
+	return map[string]any{
+		"data": map[string]any{
+			"project": map[string]any{
+				"workItem": nil,
+			},
+		},
+	}
 }
 
 // newTrackerForTest constructs an adapter pointed at the fake server with a
@@ -178,20 +307,22 @@ func TestParseRepo(t *testing.T) {
 
 func TestGet_HappyPath(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/octocat/hello-world/issues/42", func(w http.ResponseWriter, r *http.Request) {
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer tkn-test" {
 			t.Errorf("Authorization = %q, want Bearer tkn-test", got)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"iid": 42,
-			"title": "Found a bug",
-			"description": "It does not work",
-			"state": "opened",
-			"web_url": "https://gitlab.com/octocat/hello-world/-/issues/42",
-			"labels": ["bug","critical"],
-			"assignees": [{"username":"alice"},{"username":"bob"}]
-		}`))
+		vars := gqlReq(t, readBody(t, r))
+		if fp, _ := vars["fullPath"].(string); fp != "octocat/hello-world" {
+			t.Errorf("fullPath = %q, want octocat/hello-world", fp)
+		}
+		if iid, _ := vars["iid"].(string); iid != "42" {
+			t.Errorf("iid = %q, want 42", iid)
+		}
+		writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+			"42", "Found a bug", "It does not work", "opened",
+			"https://gitlab.com/octocat/hello-world/-/issues/42",
+			[]string{"bug", "critical"}, []string{"alice", "bob"},
+		)))
 	})
 	tr := newTrackerForTest(t, f)
 
@@ -228,15 +359,12 @@ func TestGet_StateMapping(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeGL(t)
-			payload := map[string]any{
-				"iid":     1,
-				"title":   "t",
-				"state":   tc.glState,
-				"web_url": "https://gitlab.com/o/r/-/issues/1",
-			}
-			b, _ := json.Marshal(payload)
-			f.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
-				_, _ = w.Write(b)
+			f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+					"1", "t", "", tc.glState,
+					"https://gitlab.com/o/r/-/issues/1",
+					nil, nil,
+				)))
 			})
 			tr := newTrackerForTest(t, f)
 			issue, err := tr.Get(ctx(), domain.TrackerID{Provider: domain.TrackerProviderGitLab, Native: "o/r#1"})
@@ -252,8 +380,16 @@ func TestGet_StateMapping(t *testing.T) {
 
 func TestGet_NestedGroup(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/group/sub/project/issues/7", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"iid":7,"title":"nested","description":"d","state":"opened","web_url":"https://gitlab.com/group/sub/project/-/issues/7"}`))
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		vars := gqlReq(t, readBody(t, r))
+		if fp, _ := vars["fullPath"].(string); fp != "group/sub/project" {
+			t.Errorf("fullPath = %q, want group/sub/project", fp)
+		}
+		writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+			"7", "nested", "d", "opened",
+			"https://gitlab.com/group/sub/project/-/issues/7",
+			nil, nil,
+		)))
 	})
 	tr := newTrackerForTest(t, f)
 	issue, err := tr.Get(ctx(), domain.TrackerID{Provider: domain.TrackerProviderGitLab, Native: "group/sub/project#7"})
@@ -265,10 +401,34 @@ func TestGet_NestedGroup(t *testing.T) {
 	}
 }
 
-func TestGet_NotFound(t *testing.T) {
+func TestGet_NotFound_GraphQLErrors(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"message":"404 Not Found"}`, http.StatusNotFound)
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, buildGraphQLErrorResponse("NOT_FOUND", "project not found"))
+	})
+	tr := newTrackerForTest(t, f)
+	_, err := tr.Get(ctx(), domain.TrackerID{Provider: domain.TrackerProviderGitLab, Native: "o/r#1"})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGet_NotFound_NullProject(t *testing.T) {
+	f := newFakeGL(t)
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, buildNullProjectResponse())
+	})
+	tr := newTrackerForTest(t, f)
+	_, err := tr.Get(ctx(), domain.TrackerID{Provider: domain.TrackerProviderGitLab, Native: "o/r#1"})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGet_NotFound_NullWorkItem(t *testing.T) {
+	f := newFakeGL(t)
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, buildNullWorkItemResponse())
 	})
 	tr := newTrackerForTest(t, f)
 	_, err := tr.Get(ctx(), domain.TrackerID{Provider: domain.TrackerProviderGitLab, Native: "o/r#1"})
@@ -280,7 +440,7 @@ func TestGet_NotFound(t *testing.T) {
 func TestGet_RateLimited(t *testing.T) {
 	f := newFakeGL(t)
 	reset := time.Now().Add(2 * time.Minute).Unix()
-	f.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("RateLimit-Reset", strconv.FormatInt(reset, 10))
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, `{"message":"Too many requests"}`, http.StatusTooManyRequests)
@@ -304,7 +464,7 @@ func TestGet_RateLimited(t *testing.T) {
 
 func TestGet_AuthFailed(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"401 Unauthorized"}`, http.StatusUnauthorized)
 	})
 	tr := newTrackerForTest(t, f)
@@ -316,7 +476,7 @@ func TestGet_AuthFailed(t *testing.T) {
 
 func TestGet_ForbiddenAuthFailed(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"403 Forbidden"}`, http.StatusForbidden)
 	})
 	tr := newTrackerForTest(t, f)
@@ -346,8 +506,12 @@ func TestGet_RejectsEmptyProvider(t *testing.T) {
 
 func TestGet_CanonicalizesProviderOnOutput(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"iid":1,"title":"t","description":"","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/1"}`))
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+			"1", "t", "", "opened",
+			"https://gitlab.com/o/r/-/issues/1",
+			nil, nil,
+		)))
 	})
 	tr := newTrackerForTest(t, f)
 	issue, err := tr.Get(ctx(), domain.TrackerID{Provider: domain.TrackerProviderGitLab, Native: "o/r#1"})
@@ -364,8 +528,12 @@ func TestGet_CanonicalizesProviderOnOutput(t *testing.T) {
 
 func TestGet_EmptyLabelsAndAssigneesAreNil(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"iid":1,"title":"t","description":"","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/1"}`))
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+			"1", "t", "", "opened",
+			"https://gitlab.com/o/r/-/issues/1",
+			nil, nil,
+		)))
 	})
 	tr := newTrackerForTest(t, f)
 	issue, err := tr.Get(ctx(), domain.TrackerID{Provider: domain.TrackerProviderGitLab, Native: "o/r#1"})
@@ -455,18 +623,24 @@ func TestPreflight_RetriesAfterFailure(t *testing.T) {
 
 func TestList_HappyPath(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/o/r/issues", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		if got := q.Get("state"); got != "all" {
-			t.Errorf("state = %q, want all (default)", got)
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		vars := gqlReq(t, readBody(t, r))
+		if fp, _ := vars["fullPath"].(string); fp != "o/r" {
+			t.Errorf("fullPath = %q, want o/r", fp)
 		}
-		if got := q.Get("per_page"); got != "100" {
-			t.Errorf("per_page = %q, want 100 (default)", got)
+		if state, _ := vars["state"].(string); state != "ALL" {
+			t.Errorf("state = %q, want ALL (default)", state)
 		}
-		_, _ = w.Write([]byte(`[
-			{"iid":1,"title":"first","description":"b1","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/1","labels":["bug"]},
-			{"iid":2,"title":"second","description":"b2","state":"closed","web_url":"https://gitlab.com/o/r/-/issues/2","assignees":[{"username":"alice"}]}
-		]`))
+		if first, _ := vars["first"].(float64); int(first) != listPageSize {
+			t.Errorf("first = %v, want %d", first, listPageSize)
+		}
+		nodes := []any{
+			buildWorkItemNode("1", "first", "b1", "opened",
+				"https://gitlab.com/o/r/-/issues/1", []string{"bug"}, nil),
+			buildWorkItemNode("2", "second", "b2", "closed",
+				"https://gitlab.com/o/r/-/issues/2", nil, []string{"alice"}),
+		}
+		writeJSON(t, w, buildListResponse(nodes, false, ""))
 	})
 	tr := newTrackerForTest(t, f)
 	issues, err := tr.List(ctx(), domain.TrackerRepo{Provider: domain.TrackerProviderGitLab, Native: "o/r"}, domain.ListFilter{})
@@ -479,6 +653,9 @@ func TestList_HappyPath(t *testing.T) {
 	if issues[0].ID.Native != "o/r#1" || issues[0].State != domain.IssueOpen || issues[0].Title != "first" {
 		t.Fatalf("issues[0] = %#v", issues[0])
 	}
+	if issues[0].Labels == nil || len(issues[0].Labels) != 1 || issues[0].Labels[0] != "bug" {
+		t.Fatalf("issues[0].Labels = %#v, want [bug]", issues[0].Labels)
+	}
 	if issues[1].ID.Native != "o/r#2" || issues[1].State != domain.IssueDone || len(issues[1].Assignees) != 1 || issues[1].Assignees[0] != "alice" {
 		t.Fatalf("issues[1] = %#v", issues[1])
 	}
@@ -486,37 +663,69 @@ func TestList_HappyPath(t *testing.T) {
 
 func TestList_QueryEncoding(t *testing.T) {
 	cases := []struct {
-		name   string
-		filter domain.ListFilter
-		wantQ  map[string]string
+		name         string
+		filter       domain.ListFilter
+		wantState    string
+		wantAssignee []string
+		wantLabels   []string
 	}{
 		{
-			name:   "open + labels + assignee + limit",
-			filter: domain.ListFilter{State: domain.ListOpen, Labels: []string{"bug", "help wanted"}, Assignee: "alice", Limit: 50},
-			wantQ:  map[string]string{"state": "opened", "labels": "bug,help wanted", "assignee_username": "alice", "per_page": "100"},
+			name:         "open + labels + assignee + limit",
+			filter:       domain.ListFilter{State: domain.ListOpen, Labels: []string{"bug", "help wanted"}, Assignee: "alice", Limit: 50},
+			wantState:    "OPENED",
+			wantAssignee: []string{"alice"},
+			wantLabels:   []string{"bug", "help wanted"},
 		},
 		{
-			name:   "closed only",
-			filter: domain.ListFilter{State: domain.ListClosed},
-			wantQ:  map[string]string{"state": "closed", "per_page": "100"},
+			name:         "closed only",
+			filter:       domain.ListFilter{State: domain.ListClosed},
+			wantState:    "CLOSED",
+			wantAssignee: nil,
+			wantLabels:   nil,
 		},
 		{
-			name:   "large total limit still uses max page size",
-			filter: domain.ListFilter{Limit: 9999},
-			wantQ:  map[string]string{"state": "all", "per_page": "100"},
+			name:       "default (all)",
+			filter:      domain.ListFilter{},
+			wantState:  "ALL",
+			wantAssignee: nil,
+			wantLabels:   nil,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeGL(t)
-			f.on("GET", "/projects/o/r/issues", func(w http.ResponseWriter, r *http.Request) {
-				got := r.URL.Query()
-				for k, want := range tc.wantQ {
-					if g := got.Get(k); g != want {
-						t.Errorf("query[%q] = %q, want %q", k, g, want)
-					}
+			f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+				vars := gqlReq(t, readBody(t, r))
+				if state, _ := vars["state"].(string); state != tc.wantState {
+					t.Errorf("state = %q, want %q", state, tc.wantState)
 				}
-				_, _ = w.Write([]byte(`[]`))
+				if assignees, _ := vars["assigneeUsernames"].([]any); tc.wantAssignee != nil {
+					if len(assignees) != len(tc.wantAssignee) {
+						t.Errorf("assigneeUsernames len = %d, want %d", len(assignees), len(tc.wantAssignee))
+					} else {
+						for i, want := range tc.wantAssignee {
+							if got, _ := assignees[i].(string); got != want {
+								t.Errorf("assigneeUsernames[%d] = %q, want %q", i, got, want)
+							}
+						}
+					}
+				} else if assignees != nil {
+					t.Errorf("assigneeUsernames = %#v, want nil", assignees)
+				}
+				if labels, _ := vars["labelName"].([]any); tc.wantLabels != nil {
+					if len(labels) != len(tc.wantLabels) {
+						t.Errorf("labelName len = %d, want %d", len(labels), len(tc.wantLabels))
+					} else {
+						for i, want := range tc.wantLabels {
+							if got, _ := labels[i].(string); got != want {
+								t.Errorf("labelName[%d] = %q, want %q", i, got, want)
+							}
+						}
+					}
+				} else if labels != nil {
+					t.Errorf("labelName = %#v, want nil", labels)
+				}
+				writeJSON(t, w, buildListResponse(nil, false, ""))
 			})
 			tr := newTrackerForTest(t, f)
 			if _, err := tr.List(ctx(), domain.TrackerRepo{Provider: domain.TrackerProviderGitLab, Native: "o/r"}, tc.filter); err != nil {
@@ -526,17 +735,22 @@ func TestList_QueryEncoding(t *testing.T) {
 	}
 }
 
-func TestList_PaginatesAcrossLinkNext(t *testing.T) {
+func TestList_PaginatesViaCursor(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/o/r/issues", func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Query().Get("page") {
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		vars := gqlReq(t, readBody(t, r))
+		after, _ := vars["after"].(string)
+		switch after {
 		case "":
-			w.Header().Set("Link", `<`+f.server.URL+`/projects/o/r/issues?state=all&per_page=100&page=2>; rel="next"`)
-			_, _ = w.Write([]byte(`[{"iid":1,"title":"first","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/1"}]`))
-		case "2":
-			_, _ = w.Write([]byte(`[{"iid":2,"title":"second","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/2"}]`))
+			node := buildWorkItemNode("1", "first", "", "opened",
+				"https://gitlab.com/o/r/-/issues/1", nil, nil)
+			writeJSON(t, w, buildListResponse([]any{node}, true, "cursor-1"))
+		case "cursor-1":
+			node := buildWorkItemNode("2", "second", "", "opened",
+				"https://gitlab.com/o/r/-/issues/2", nil, nil)
+			writeJSON(t, w, buildListResponse([]any{node}, false, ""))
 		default:
-			t.Fatalf("unexpected page %q", r.URL.Query().Get("page"))
+			t.Fatalf("unexpected after cursor %q", after)
 		}
 	})
 	tr := newTrackerForTest(t, f)
@@ -552,13 +766,16 @@ func TestList_PaginatesAcrossLinkNext(t *testing.T) {
 
 func TestList_RespectsLimit(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/o/r/issues", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Link", `<`+f.server.URL+`/projects/o/r/issues?state=all&per_page=100&page=2>; rel="next"`)
-		_, _ = w.Write([]byte(`[
-			{"iid":1,"title":"first","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/1"},
-			{"iid":2,"title":"second","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/2"},
-			{"iid":3,"title":"third","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/3"}
-		]`))
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		nodes := []any{
+			buildWorkItemNode("1", "first", "", "opened",
+				"https://gitlab.com/o/r/-/issues/1", nil, nil),
+			buildWorkItemNode("2", "second", "", "opened",
+				"https://gitlab.com/o/r/-/issues/2", nil, nil),
+			buildWorkItemNode("3", "third", "", "opened",
+				"https://gitlab.com/o/r/-/issues/3", nil, nil),
+		}
+		writeJSON(t, w, buildListResponse(nodes, false, ""))
 	})
 	tr := newTrackerForTest(t, f)
 	issues, err := tr.List(ctx(), domain.TrackerRepo{Provider: domain.TrackerProviderGitLab, Native: "o/r"}, domain.ListFilter{Limit: 2})
@@ -575,8 +792,14 @@ func TestList_RespectsLimit(t *testing.T) {
 
 func TestList_NestedGroup(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/group/sub/proj/issues", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`[{"iid":1,"title":"nested","state":"opened","web_url":"https://gitlab.com/group/sub/proj/-/issues/1"}]`))
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		vars := gqlReq(t, readBody(t, r))
+		if fp, _ := vars["fullPath"].(string); fp != "group/sub/proj" {
+			t.Errorf("fullPath = %q, want group/sub/proj", fp)
+		}
+		node := buildWorkItemNode("1", "nested", "", "opened",
+			"https://gitlab.com/group/sub/proj/-/issues/1", nil, nil)
+		writeJSON(t, w, buildListResponse([]any{node}, false, ""))
 	})
 	tr := newTrackerForTest(t, f)
 	issues, err := tr.List(ctx(), domain.TrackerRepo{Provider: domain.TrackerProviderGitLab, Native: "group/sub/proj"}, domain.ListFilter{})
@@ -621,10 +844,10 @@ func TestList_RejectsBadRepo(t *testing.T) {
 	}
 }
 
-func TestList_NotFound(t *testing.T) {
+func TestList_NotFound_GraphQLErrors(t *testing.T) {
 	f := newFakeGL(t)
-	f.on("GET", "/projects/o/r/issues", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"message":"404 Project Not Found"}`, http.StatusNotFound)
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, buildGraphQLErrorResponse("NOT_FOUND", "project not found"))
 	})
 	tr := newTrackerForTest(t, f)
 	_, err := tr.List(ctx(), domain.TrackerRepo{Provider: domain.TrackerProviderGitLab, Native: "o/r"}, domain.ListFilter{})
@@ -633,9 +856,44 @@ func TestList_NotFound(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// ParseLinkNext
-// ---------------------------------------------------------------------------
+func TestList_NotFound_NullProject(t *testing.T) {
+	f := newFakeGL(t)
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, buildNullProjectResponse())
+	})
+	tr := newTrackerForTest(t, f)
+	_, err := tr.List(ctx(), domain.TrackerRepo{Provider: domain.TrackerProviderGitLab, Native: "o/r"}, domain.ListFilter{})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestList_AuthFailed(t *testing.T) {
+	f := newFakeGL(t)
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"401 Unauthorized"}`, http.StatusUnauthorized)
+	})
+	tr := newTrackerForTest(t, f)
+	_, err := tr.List(ctx(), domain.TrackerRepo{Provider: domain.TrackerProviderGitLab, Native: "o/r"}, domain.ListFilter{})
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("err = %v, want ErrAuthFailed", err)
+	}
+}
+
+func TestList_RateLimited(t *testing.T) {
+	f := newFakeGL(t)
+	reset := time.Now().Add(2 * time.Minute).Unix()
+	f.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("RateLimit-Reset", strconv.FormatInt(reset, 10))
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, `{"message":"Too many requests"}`, http.StatusTooManyRequests)
+	})
+	tr := newTrackerForTest(t, f)
+	_, err := tr.List(ctx(), domain.TrackerRepo{Provider: domain.TrackerProviderGitLab, Native: "o/r"}, domain.ListFilter{})
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Domain validation
@@ -686,7 +944,7 @@ func TestTrackerIntakeConfig_WithDefaultsStillGitHub(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Host-aware tracker (ticket 09)
+// Host-aware tracker
 // ---------------------------------------------------------------------------
 
 // newHostAwareTrackerForTest constructs a host-aware tracker with a default
@@ -739,18 +997,15 @@ func TestGet_SelfManagedHost_RoutesToCorrectBaseURLAndToken(t *testing.T) {
 	})
 
 	// Register handler on the self-managed server only.
-	selfManagedSrv.on("GET", "/projects/group/project/issues/42", func(w http.ResponseWriter, r *http.Request) {
+	selfManagedSrv.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer tkn-internal" {
 			t.Errorf("Authorization = %q, want Bearer tkn-internal", got)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"iid": 42,
-			"title": "Self-managed issue",
-			"description": "d",
-			"state": "opened",
-			"web_url": "https://gitlab.internal/group/project/-/issues/42"
-		}`))
+		writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+			"42", "Self-managed issue", "d", "opened",
+			"https://gitlab.internal/group/project/-/issues/42",
+			nil, nil,
+		)))
 	})
 
 	issue, err := tr.Get(ctx(), domain.TrackerID{
@@ -777,11 +1032,15 @@ func TestGet_DefaultHost_BackwardCompat(t *testing.T) {
 	defaultSrv := newFakeGL(t)
 	tr := newHostAwareTrackerForTest(t, defaultSrv, nil)
 
-	defaultSrv.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
+	defaultSrv.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer tkn-default" {
 			t.Errorf("Authorization = %q, want Bearer tkn-default", got)
 		}
-		_, _ = w.Write([]byte(`{"iid":1,"title":"default","description":"","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/1"}`))
+		writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+			"1", "default", "", "opened",
+			"https://gitlab.com/o/r/-/issues/1",
+			nil, nil,
+		)))
 	})
 
 	// Host: "" routes to the default (gitlab.com) server.
@@ -801,8 +1060,12 @@ func TestGet_GitLabComExplicit_RoutesToDefault(t *testing.T) {
 	defaultSrv := newFakeGL(t)
 	tr := newHostAwareTrackerForTest(t, defaultSrv, nil)
 
-	defaultSrv.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"iid":1,"title":"t","description":"","state":"opened","web_url":"https://gitlab.com/o/r/-/issues/1"}`))
+	defaultSrv.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+			"1", "t", "", "opened",
+			"https://gitlab.com/o/r/-/issues/1",
+			nil, nil,
+		)))
 	})
 
 	// Host: "gitlab.com" should route to the default, same as Host: "".
@@ -848,11 +1111,13 @@ func TestList_SelfManagedHost_RoutesCorrectly(t *testing.T) {
 		"gitlab.internal": {server: selfManagedSrv, token: "tkn-internal"},
 	})
 
-	selfManagedSrv.on("GET", "/projects/group/proj/issues", func(w http.ResponseWriter, r *http.Request) {
+	selfManagedSrv.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer tkn-internal" {
 			t.Errorf("Authorization = %q, want Bearer tkn-internal", got)
 		}
-		_, _ = w.Write([]byte(`[{"iid":1,"title":"sm","description":"d","state":"opened","web_url":"https://gitlab.internal/group/proj/-/issues/1"}]`))
+		node := buildWorkItemNode("1", "sm", "d", "opened",
+			"https://gitlab.internal/group/proj/-/issues/1", nil, nil)
+		writeJSON(t, w, buildListResponse([]any{node}, false, ""))
 	})
 
 	issues, err := tr.List(ctx(), domain.TrackerRepo{
@@ -904,12 +1169,16 @@ func TestGet_SelfManagedHost_FallsBackToDefaultToken(t *testing.T) {
 		"gitlab.internal": {server: selfManagedSrv},
 	})
 
-	selfManagedSrv.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
+	selfManagedSrv.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
 		// Should use the default token since no per-host token was configured.
 		if got := r.Header.Get("Authorization"); got != "Bearer tkn-default" {
 			t.Errorf("Authorization = %q, want Bearer tkn-default", got)
 		}
-		_, _ = w.Write([]byte(`{"iid":1,"title":"t","description":"","state":"opened","web_url":"https://gitlab.internal/o/r/-/issues/1"}`))
+		writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+			"1", "t", "", "opened",
+			"https://gitlab.internal/o/r/-/issues/1",
+			nil, nil,
+		)))
 	})
 
 	_, err := tr.Get(ctx(), domain.TrackerID{
@@ -933,8 +1202,12 @@ func TestGet_HostCaseInsensitive(t *testing.T) {
 		"gitlab.internal": {server: selfManagedSrv, token: "tkn-internal"},
 	})
 
-	selfManagedSrv.on("GET", "/projects/o/r/issues/1", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"iid":1,"title":"t","description":"","state":"opened","web_url":"https://gitlab.internal/o/r/-/issues/1"}`))
+	selfManagedSrv.onGraphQL(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, buildGetResponse(buildWorkItemNode(
+			"1", "t", "", "opened",
+			"https://gitlab.internal/o/r/-/issues/1",
+			nil, nil,
+		)))
 	})
 
 	// Upper-case host should match the lower-cased allowlist entry.
@@ -947,3 +1220,20 @@ func TestGet_HostCaseInsensitive(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// readBody reads r.Body fully and returns the string. Fails the test on error.
+func readBody(t *testing.T, r *http.Request) string {
+	t.Helper()
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(b)
+}
+
+// Ensure fmt import is used.
+var _ = fmt.Sprintf
