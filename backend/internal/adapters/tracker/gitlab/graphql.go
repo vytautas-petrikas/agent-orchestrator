@@ -29,8 +29,8 @@ type graphqlError struct {
 // Data field is decoded into the specific query result type by each
 // caller.
 type graphqlResponse struct {
-	Data   json.RawMessage   `json:"data"`
-	Errors []graphqlError   `json:"errors"`
+	Data   json.RawMessage `json:"data"`
+	Errors []graphqlError  `json:"errors"`
 }
 
 // ---------------------------------------------------------------------------
@@ -61,11 +61,11 @@ type wiConnection struct {
 // workItemNode is the selection set from the GraphQL workItems query.
 // Details (description, labels, assignees) are exposed as typed widgets.
 type workItemNode struct {
-	IID         string          `json:"iid"`
-	Title       string          `json:"title"`
-	Description *string         `json:"description"`
-	State       string          `json:"state"`
-	WebURL      string          `json:"webUrl"`
+	IID         string           `json:"iid"`
+	Title       string           `json:"title"`
+	Description *string          `json:"description"`
+	State       string           `json:"state"`
+	WebURL      string           `json:"webUrl"`
 	Widgets     []workItemWidget `json:"widgets"`
 }
 

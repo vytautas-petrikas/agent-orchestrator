@@ -684,9 +684,9 @@ func TestList_QueryEncoding(t *testing.T) {
 			wantLabels:   nil,
 		},
 		{
-			name:       "default (all)",
-			filter:      domain.ListFilter{},
-			wantState:  "ALL",
+			name:         "default (all)",
+			filter:       domain.ListFilter{},
+			wantState:    "ALL",
 			wantAssignee: nil,
 			wantLabels:   nil,
 		},
