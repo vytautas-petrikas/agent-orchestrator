@@ -1,4 +1,4 @@
-# ADR 1. GitLab tracker adapter uses GraphQL for Work Items `List` and `Get`
+# 1. GitLab tracker adapter uses GraphQL for Work Items `List` and `Get`
 
 Date: 2026-08-24
 Status: Accepted
