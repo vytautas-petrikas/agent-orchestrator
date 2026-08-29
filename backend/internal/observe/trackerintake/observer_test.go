@@ -474,3 +474,106 @@ func TestTrackerRepoGitLabSelfManagedWithPort(t *testing.T) {
 		t.Errorf("Host = %q, want gitlab.local:8443", repo.Host)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// cleanRepoPath / parseRepoNative — GitLab nested group preservation
+// ---------------------------------------------------------------------------
+
+func TestCleanRepoPath_GitLab_NestedGroupPreserved(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"nested group", "group/subgroup/repo", "group/subgroup/repo"},
+		{"deeply nested", "a/b/c/d/repo", "a/b/c/d/repo"},
+		{"simple two-segment", "group/project", "group/project"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cleanRepoPath(tc.input, domain.TrackerProviderGitLab)
+			if got != tc.want {
+				t.Fatalf("cleanRepoPath(%q, gitlab) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCleanRepoPath_GitHub_LastTwoSegmentsOnly(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"nested group truncated", "group/subgroup/repo", "subgroup/repo"},
+		{"simple two-segment", "owner/repo", "owner/repo"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cleanRepoPath(tc.input, domain.TrackerProviderGitHub)
+			if got != tc.want {
+				t.Fatalf("cleanRepoPath(%q, github) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseRepoNative_GitLab_NestedGroupHTTPS(t *testing.T) {
+	got, ok := parseRepoNative("https://gitlab.com/group/subgroup/repo.git", domain.TrackerProviderGitLab)
+	if !ok {
+		t.Fatal("parseRepoNative ok = false")
+	}
+	if got != "group/subgroup/repo" {
+		t.Fatalf("got %q, want group/subgroup/repo", got)
+	}
+}
+
+func TestParseRepoNative_GitLab_NestedGroupSSH(t *testing.T) {
+	got, ok := parseRepoNative("git@gitlab.com:group/subgroup/repo.git", domain.TrackerProviderGitLab)
+	if !ok {
+		t.Fatal("parseRepoNative ok = false")
+	}
+	if got != "group/subgroup/repo" {
+		t.Fatalf("got %q, want group/subgroup/repo", got)
+	}
+}
+
+func TestParseRepoNative_GitHub_NestedGroupTruncated(t *testing.T) {
+	got, ok := parseRepoNative("https://github.com/org/team/repo.git", domain.TrackerProviderGitHub)
+	if !ok {
+		t.Fatal("parseRepoNative ok = false")
+	}
+	// GitHub always truncates to last two segments.
+	if got != "team/repo" {
+		t.Fatalf("got %q, want team/repo", got)
+	}
+}
+
+func TestParseRepoNative_GitLab_SimpleTwoSegment(t *testing.T) {
+	got, ok := parseRepoNative("https://gitlab.com/group/project.git", domain.TrackerProviderGitLab)
+	if !ok {
+		t.Fatal("parseRepoNative ok = false")
+	}
+	if got != "group/project" {
+		t.Fatalf("got %q, want group/project", got)
+	}
+}
+
+func TestTrackerRepoGitLab_NestedGroupFullPathPreserved(t *testing.T) {
+	project := domain.ProjectRecord{
+		ID:            "demo",
+		RepoOriginURL: "https://gitlab.com/group/subgroup/repo.git",
+		Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+			Enabled:  true,
+			Provider: domain.TrackerProviderGitLab,
+			Assignee: "alice",
+		}},
+	}
+	repo, ok := trackerRepo(project, project.Config.TrackerIntake.WithDefaults())
+	if !ok {
+		t.Fatal("trackerRepo ok = false")
+	}
+	if repo.Native != "group/subgroup/repo" {
+		t.Fatalf("Native = %q, want group/subgroup/repo (full nested path)", repo.Native)
+	}
+}

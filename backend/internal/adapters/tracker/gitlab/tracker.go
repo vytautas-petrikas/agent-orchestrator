@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -187,22 +186,8 @@ var _ ports.Tracker = (*Tracker)(nil)
 // Get
 // ---------------------------------------------------------------------------
 
-// glIssue is the subset of fields we read off the GitLab issue payload.
-type glIssue struct {
-	IID         int      `json:"iid"`
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	State       string   `json:"state"`
-	WebURL      string   `json:"web_url"`
-	Labels      []string `json:"labels"`
-	Assignees   []glUser `json:"assignees"`
-}
-
-type glUser struct {
-	Username string `json:"username"`
-}
-
-// Get fetches a single issue by id and maps it onto the normalized domain.Issue.
+// Get fetches a single work item by id via the GraphQL Work Items API and
+// maps it onto the normalized domain.Issue.
 func (t *Tracker) Get(ctx context.Context, id domain.TrackerID) (domain.Issue, error) {
 	projectPath, iid, err := t.parseID(id)
 	if err != nil {
@@ -212,50 +197,30 @@ func (t *Tracker) Get(ctx context.Context, id domain.TrackerID) (domain.Issue, e
 	if err != nil {
 		return domain.Issue{}, err
 	}
-	path := fmt.Sprintf("/projects/%s/issues/%d", url.PathEscape(projectPath), iid)
 
-	resp, err := t.do(ctx, he, http.MethodGet, path, nil)
+	vars := map[string]any{
+		"fullPath": projectPath,
+		"iid":      strconv.Itoa(iid),
+	}
+	gqlResp, err := t.graphqlDo(ctx, he, getWorkItemQuery, vars)
 	if err != nil {
 		return domain.Issue{}, err
 	}
-	var raw glIssue
-	if err := json.Unmarshal(resp, &raw); err != nil {
-		return domain.Issue{}, fmt.Errorf("gitlab tracker: decode issue: %w", err)
-	}
-	issue := issueFromGitLab(projectPath, raw)
-	issue.ID.Host = id.Host // preserve host for round-trip
-	return issue, nil
-}
 
-// issueFromGitLab projects a raw GitLab issue payload into the normalized
-// domain.Issue. projectPath is passed in because the TrackerID.Native
-// shape is "path/to/project#iid" and we want the returned ID to round-trip
-// through the same adapter. The caller sets Host on the returned Issue after
-// this function returns.
-func issueFromGitLab(projectPath string, raw glIssue) domain.Issue {
-	assignees := make([]string, 0, len(raw.Assignees))
-	for _, a := range raw.Assignees {
-		assignees = append(assignees, a.Username)
+	var data wiQueryData
+	if err := json.Unmarshal(gqlResp.Data, &data); err != nil {
+		return domain.Issue{}, fmt.Errorf("gitlab tracker: decode work item: %w", err)
 	}
-	out := domain.Issue{
-		ID: domain.TrackerID{
-			Provider: domain.TrackerProviderGitLab,
-			Native:   fmt.Sprintf("%s#%d", projectPath, raw.IID),
-		},
-		Title:     raw.Title,
-		Body:      raw.Description,
-		State:     mapStateFromGitLab(raw.State),
-		URL:       raw.WebURL,
-		Labels:    raw.Labels,
-		Assignees: assignees,
+	if err := classifyNullProject(&data); err != nil {
+		return domain.Issue{}, err
 	}
-	if len(out.Labels) == 0 {
-		out.Labels = nil
+	if data.Project.WorkItem == nil {
+		return domain.Issue{}, fmt.Errorf("%w: work item not found", ErrNotFound)
 	}
-	if len(out.Assignees) == 0 {
-		out.Assignees = nil
-	}
-	return out
+
+	issue := issueFromWorkItem(projectPath, *data.Project.WorkItem)
+	issue.ID.Host = id.Host
+	return issue, nil
 }
 
 // mapStateFromGitLab projects GitLab's opened/closed state onto the
@@ -271,9 +236,9 @@ func mapStateFromGitLab(state string) domain.NormalizedIssueState {
 // List
 // ---------------------------------------------------------------------------
 
-// List returns issues for a project, filtered by state/labels/assignee.
-// Pagination is followed via GitLab's Link-header (rel="next") until no next
-// link remains; ListFilter.Limit, when set, caps the total accumulated
+// List returns work items for a project, filtered by state/labels/assignee.
+// Pagination is cursor-based (first/after with pageInfo.endCursor/
+// hasNextPage). ListFilter.Limit, when set, caps the total accumulated
 // issue count.
 func (t *Tracker) List(ctx context.Context, repo domain.TrackerRepo, filter domain.ListFilter) ([]domain.Issue, error) {
 	if repo.Provider != domain.TrackerProviderGitLab {
@@ -288,52 +253,70 @@ func (t *Tracker) List(ctx context.Context, repo domain.TrackerRepo, filter doma
 		return nil, err
 	}
 
-	q := url.Values{}
-	switch filter.State {
-	case domain.ListOpen:
-		q.Set("state", "opened")
-	case domain.ListClosed:
-		q.Set("state", "closed")
-	default:
-		q.Set("state", "all")
-	}
-	if len(filter.Labels) > 0 {
-		q.Set("labels", strings.Join(filter.Labels, ","))
-	}
-	if filter.Assignee != "" {
-		q.Set("assignee_username", filter.Assignee)
-	}
-	q.Set("per_page", strconv.Itoa(listPageSize))
-
-	path := fmt.Sprintf("/projects/%s/issues?%s", url.PathEscape(projectPath), q.Encode())
-	out := make([]domain.Issue, 0)
+	var out []domain.Issue
 	if filter.Limit > 0 {
 		out = make([]domain.Issue, 0, filter.Limit)
+	} else {
+		out = make([]domain.Issue, 0)
 	}
-	for page := 0; path != ""; page++ {
+
+	var after string
+	for page := 0; ; page++ {
 		if page >= maxListPages {
 			return nil, fmt.Errorf("gitlab tracker: list pagination exceeded %d pages", maxListPages)
 		}
-		respBody, nextPath, err := t.roundTrip(ctx, he, http.MethodGet, path, nil)
+
+		first := listPageSize
+		if filter.Limit > 0 && first > filter.Limit {
+			first = filter.Limit
+		}
+
+		vars := map[string]any{
+			"fullPath":          projectPath,
+			"first":             first,
+			"state":             mapStateFilter(filter.State),
+			"assigneeUsernames": nil,
+			"labelName":         nil,
+		}
+		if filter.Assignee != "" {
+			vars["assigneeUsernames"] = []string{filter.Assignee}
+		}
+		if len(filter.Labels) > 0 {
+			vars["labelName"] = filter.Labels
+		}
+		if after != "" {
+			vars["after"] = after
+		}
+
+		gqlResp, err := t.graphqlDo(ctx, he, listWorkItemsQuery, vars)
 		if err != nil {
 			return nil, err
 		}
-		var raw []glIssue
-		if err := json.Unmarshal(respBody, &raw); err != nil {
-			return nil, fmt.Errorf("gitlab tracker: decode list: %w", err)
+
+		var data wiQueryData
+		if err := json.Unmarshal(gqlResp.Data, &data); err != nil {
+			return nil, fmt.Errorf("gitlab tracker: decode work items list: %w", err)
 		}
-		pageIssues := make([]domain.Issue, 0, len(raw))
-		for _, r := range raw {
-			issue := issueFromGitLab(projectPath, r)
-			issue.ID.Host = repo.Host // preserve host for round-trip
-			pageIssues = append(pageIssues, issue)
+		if err := classifyNullProject(&data); err != nil {
+			return nil, err
 		}
-		var done bool
-		out, done = httpkit.AppendIssuesWithLimit(out, pageIssues, filter.Limit)
-		if done {
+		if data.Project.WorkItems == nil {
 			break
 		}
-		path = nextPath
+
+		pageIssues := make([]domain.Issue, 0, len(data.Project.WorkItems.Nodes))
+		for _, wi := range data.Project.WorkItems.Nodes {
+			issue := issueFromWorkItem(projectPath, wi)
+			issue.ID.Host = repo.Host
+			pageIssues = append(pageIssues, issue)
+		}
+
+		var done bool
+		out, done = httpkit.AppendIssuesWithLimit(out, pageIssues, filter.Limit)
+		if done || !data.Project.WorkItems.PageInfo.HasNextPage {
+			break
+		}
+		after = data.Project.WorkItems.PageInfo.EndCursor
 	}
 	return out, nil
 }
