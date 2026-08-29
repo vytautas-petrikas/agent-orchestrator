@@ -201,7 +201,7 @@ type gqlResponse struct {
 }
 
 type gqlError struct {
-	Message string `json:"message"`
+	Message    string `json:"message"`
 	Extensions struct {
 		Code string `json:"code"`
 	} `json:"extensions"`
@@ -212,7 +212,7 @@ type gqlError struct {
 // GraphQL response. The ID field (global GraphQL ID) is fetched for future
 // use but not currently surfaced to the domain.
 type gqlWorkItem struct {
-	ID string `json:"id"` // global GraphQL ID; not yet surfaced to domain
+	ID          string `json:"id"` // global GraphQL ID; not yet surfaced to domain
 	IID         string `json:"iid"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
@@ -417,7 +417,7 @@ func (t *Tracker) List(ctx context.Context, repo domain.TrackerRepo, filter doma
 
 	vars := map[string]any{
 		"fullPath": projectPath,
-		"first":   listPageSize,
+		"first":    listPageSize,
 	}
 	if stateFilter != "all" {
 		vars["state"] = stateFilter
